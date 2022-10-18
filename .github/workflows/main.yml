@@ -1,4 +1,4 @@
-name: Build DOCR
+name: Build Neosynth
 
 on:
   push:
