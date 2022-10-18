@@ -1,0 +1,24 @@
+[package]
+name = "neosynth"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "neosynth"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+crossbeam-queue = "0.3.6"
+pyo3 = { version = "0.17.2", features = ["extension-module"] }
+
+[dependencies.windows]
+version = "0.42.0"
+features = [
+    "Media_Core",
+    "Media_Playback",
+    "Media_SpeechSynthesis",
+    "Storage_Streams",
+    "Foundation",
+    "Foundation_Metadata",
+    "Foundation_Collections"
+]

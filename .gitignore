@@ -1,0 +1,13 @@
+/target
+/Cargo.lock
+
+
+# pycache
+/__pycache__
+
+# dist folder
+dist/
+
+# Python virtual environments
+.venv
+.env
