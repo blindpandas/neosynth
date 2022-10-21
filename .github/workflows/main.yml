@@ -1,4 +1,4 @@
-name: Build Neosynth
+name: Build Wheels
 
 on:
   push:
@@ -19,7 +19,7 @@ jobs:
       - name: Cargo check
         run: cargo check --verbose
       - name: Cargo test
-        run: cargo test --verbose -- --skip "test_it_handles_rtl"
+        run: cargo test --verbose
       - name: setup python
         uses: actions/setup-python@v3
         with:
@@ -29,12 +29,8 @@ jobs:
         run: python -m pip install --upgrade pip setuptools wheel
       - name: Install dependencies
         run: python -m pip install invoke twine maturin
-      - name: Build binaries
-        run: python -m invoke build-all --release
       - name: Build python wheels
         run: python -m invoke build-wheels --release --strip
-      - name: Copy artifacts
-        run: python -m invoke copy-artifacts --release
       - name: Publish distribution 📦 to PyPI
         if: startsWith(github.ref, 'refs/tags')
         run: python -m invoke upload-wheels

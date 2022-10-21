@@ -4,7 +4,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use windows::{
     core::HSTRING, Foundation::Metadata::ApiInformation, Foundation::TypedEventHandler,
     Media::Core::MediaSource, Media::Playback::*, Media::SpeechSynthesis::*, Storage::StorageFile,
@@ -47,17 +47,24 @@ impl From<NeosynthError> for PyErr {
     }
 }
 
-#[derive(Debug, Clone)]
 #[pyclass]
+#[derive(Default, Eq, PartialEq, Copy, Clone)]
 pub enum SynthState {
+    #[default]
     Ready = 0,
     Busy = 1,
     Paused = 2,
 }
 
-impl Default for SynthState {
-    fn default() -> Self {
-        SynthState::Ready
+#[pymethods]
+impl SynthState {
+    fn __hash__(&self) -> PyResult<isize> {
+        let evalue = match self {
+            SynthState::Ready => 0,
+            SynthState::Busy => 1,
+            SynthState::Paused => 2,
+        };
+        Ok(evalue)
     }
 }
 
@@ -81,50 +88,40 @@ pub enum SpeechElement {
     Audio(String),
 }
 
-#[derive(Clone)]
 #[pyclass(subclass)]
-pub struct SpeechUtterance {
-    content: Vec<SpeechElement>,
-}
-
-impl Default for SpeechUtterance {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+#[derive(Default, Clone)]
+pub struct SpeechUtterance(Vec<SpeechElement>);
 
 #[pymethods]
 impl SpeechUtterance {
     #[new]
     pub fn new() -> Self {
-        Self {
-            content: Vec::new(),
-        }
+        Default::default()
     }
     #[pyo3(text_signature = "($self, text: str)")]
     fn add_text(&mut self, text: String) {
-        self.content.push(SpeechElement::Text(text));
+        self.0.push(SpeechElement::Text(text));
     }
     #[pyo3(text_signature = "($self, ssml: str)")]
     fn add_ssml(&mut self, ssml: String) {
-        self.content.push(SpeechElement::Ssml(ssml));
+        self.0.push(SpeechElement::Ssml(ssml));
     }
     #[pyo3(text_signature = "($self, bookmark: str)")]
     fn add_bookmark(&mut self, bookmark: String) {
-        self.content.push(SpeechElement::Bookmark(bookmark));
+        self.0.push(SpeechElement::Bookmark(bookmark));
     }
     #[pyo3(text_signature = "($self, audio_path: str)")]
     fn add_audio(&mut self, audio_path: String) {
-        self.content.push(SpeechElement::Audio(audio_path));
+        self.0.push(SpeechElement::Audio(audio_path));
     }
     #[pyo3(text_signature = "($self, utterance: neosynth.SpeechUtterance)")]
     fn add_utterance(&mut self, utterance: &mut Self) {
-        self.content.append(&mut utterance.content);
+        self.0.append(&mut utterance.0);
     }
 }
 
-#[derive(Debug)]
 #[pyclass(frozen)]
+#[derive(Debug)]
 pub struct VoiceInfo {
     #[pyo3(get)]
     pub id: String,
@@ -157,66 +154,128 @@ pub trait NsEventSink {
     fn on_bookmark_reached(&self, bookmark: String);
 }
 
-pub struct PyEventSinkWrapper {
-    py_event_sink: PyObject,
-}
+pub struct PyEventSinkWrapper(PyObject);
 
 impl PyEventSinkWrapper {
     fn new(py_event_sink: PyObject) -> Self {
-        Self { py_event_sink }
+        Self(py_event_sink)
     }
 }
 
 impl NsEventSink for PyEventSinkWrapper {
     fn on_state_changed(&self, new_state: SynthState) {
         Python::with_gil(|py| {
-            self.py_event_sink
+            self.0
                 .call_method1(py, "on_state_changed", (new_state,))
                 .ok();
         });
     }
     fn on_bookmark_reached(&self, bookmark: String) {
         Python::with_gil(|py| {
-            self.py_event_sink
+            self.0
                 .call_method1(py, "on_bookmark_reached", (bookmark,))
                 .ok();
         });
     }
 }
 
+pub struct NeoMediaPlayer(MediaPlayer);
+
+impl NeoMediaPlayer {
+    fn new() -> NeosynthResult<Self> {
+        let win_player = MediaPlayer::new()?;
+        win_player.SetAudioCategory(MediaPlayerAudioCategory::Speech)?;
+        Ok(Self(win_player))
+    }
+    pub fn get_playback_state(&self) -> NeosynthResult<MediaPlaybackState> {
+        Ok(self.0.PlaybackSession()?.PlaybackState()?)
+    }
+    pub fn get_volume(&self) -> NeosynthResult<f64> {
+        Ok(self.0.Volume()? * 100f64)
+    }
+    pub fn set_volume(&self, volume: f64) -> NeosynthResult<()> {
+        Ok(self.0.SetVolume(volume / 100f64)?)
+    }
+    fn set_speech_stream_source(&self, stream: SpeechSynthesisStream) -> NeosynthResult<()> {
+        self.0.SetSource(&MediaSource::CreateFromStream(
+            &stream,
+            &stream.ContentType()?,
+        )?)?;
+        Ok(())
+    }
+    fn set_file_source(&self, file_path: String) -> NeosynthResult<()> {
+        let audiofile = StorageFile::GetFileFromPathAsync(&HSTRING::from(file_path))?.get()?;
+        self.0
+            .SetSource(&MediaSource::CreateFromStorageFile(&audiofile)?)?;
+        Ok(())
+    }
+    fn play(&self) -> NeosynthResult<()> {
+        self.0.Play()?;
+        Ok(())
+    }
+    fn pause(&self) -> NeosynthResult<()> {
+        self.0.Pause()?;
+        Ok(())
+    }
+    fn resume(&self) -> NeosynthResult<()> {
+        if self.get_playback_state()? == MediaPlaybackState::Paused {
+            self.0.Play()?;
+        }
+        Ok(())
+    }
+    fn stop(&self) -> NeosynthResult<()> {
+        self.pause()?;
+        let empty_stream = InMemoryRandomAccessStream::new()?;
+        self.0.SetSource(&MediaSource::CreateFromStream(
+            &empty_stream,
+            &HSTRING::from(""),
+        )?)?;
+        Ok(())
+    }
+}
+
 struct SpeechMixer<T>
 where
-    T: NsEventSink + std::marker::Send + 'static,
+    T: NsEventSink + std::marker::Send + std::marker::Sync + 'static,
 {
     synthesizer: SpeechSynthesizer,
-    player: MediaPlayer,
+    player: NeoMediaPlayer,
+    state: RwLock<SynthState>,
     speech_queue: SegQueue<SpeechElement>,
     event_sink: T,
 }
 
 impl<T> SpeechMixer<T>
 where
-    T: NsEventSink + std::marker::Send + 'static,
+    T: NsEventSink + std::marker::Send + std::marker::Sync + 'static,
 {
     pub fn new(event_sink: T) -> NeosynthResult<Self> {
         Ok(Self {
             synthesizer: SpeechSynthesizer::new()?,
-            player: MediaPlayer::new()?,
+            player: NeoMediaPlayer::new()?,
+            state: RwLock::new(Default::default()),
             speech_queue: SegQueue::new(),
             event_sink,
         })
     }
 
     pub fn get_state(&self) -> NeosynthResult<SynthState> {
-        Ok(self.player.PlaybackSession()?.PlaybackState()?.into())
+        Ok(*self.state.read().unwrap())
+    }
+
+    pub fn set_state(&self, state: SynthState) -> NeosynthResult<()> {
+        if self.get_state()? != state {
+            let mut wst = self.state.write().unwrap();
+            *wst = state;
+            self.event_sink.on_state_changed(state);
+        }
+        Ok(())
     }
 
     pub fn speak_content(&self, text: &str, is_ssml: bool) -> NeosynthResult<()> {
         let stream = self.generate_speech_stream(text, is_ssml)?;
-        self.player.SetSource(&MediaSource::CreateFromStream(
-            &stream,
-            &stream.ContentType()?,
-        )?)?;
+        self.player.set_speech_stream_source(stream)?;
+        self.player.play()?;
         Ok(())
     }
 
@@ -239,27 +298,22 @@ where
 
     pub fn process_speech_element(&self, element: SpeechElement) -> NeosynthResult<()> {
         match element {
-            SpeechElement::Text(text) => self.speak_content(&text, false),
-            SpeechElement::Ssml(ssml) => self.speak_content(&ssml, true),
+            SpeechElement::Text(text) => self.speak_content(&text, false)?,
+            SpeechElement::Ssml(ssml) => self.speak_content(&ssml, true)?,
             SpeechElement::Bookmark(bookmark) => {
                 self.event_sink.on_bookmark_reached(bookmark);
-                self.process_queue()
+                self.process_queue()?;
             }
-            SpeechElement::Audio(filename) => {
-                let audiofile =
-                    StorageFile::GetFileFromPathAsync(&HSTRING::from(filename))?.get()?;
-                self.player
-                    .SetSource(&MediaSource::CreateFromStorageFile(&audiofile)?)?;
-                Ok(())
-            }
-        }
+            SpeechElement::Audio(filename) => self.player.set_file_source(filename)?,
+        };
+        Ok(())
     }
 
     fn process_queue(&self) -> NeosynthResult<()> {
         match self.speech_queue.pop() {
             Some(elem) => self.process_speech_element(elem),
             None => {
-                self.event_sink.on_state_changed(SynthState::Ready);
+                self.set_state(SynthState::Ready)?;
                 Ok(())
             }
         }
@@ -269,85 +323,70 @@ where
     where
         I: IntoIterator<Item = SpeechElement>,
     {
+        self.clear_speech_queue()?;
         utterance
             .into_iter()
             .for_each(|elem| self.speech_queue.push(elem));
-        match self.get_state()? {
-            SynthState::Ready => match self.speech_queue.pop() {
-                Some(element) => self.process_speech_element(element),
-                None => Ok(()),
-            },
-            _ => Ok(()),
+        self.process_queue()
+    }
+    pub fn clear_speech_queue(&self) -> NeosynthResult<()> {
+        loop {
+            if self.speech_queue.pop().is_none() {
+                break;
+            }
         }
+        Ok(())
     }
 }
 
 #[pyclass(subclass, frozen)]
-pub struct Neosynth {
-    mixer: Arc<SpeechMixer<PyEventSinkWrapper>>,
-}
+pub struct Neosynth(Arc<SpeechMixer<PyEventSinkWrapper>>);
 
 impl Neosynth {
     pub fn new(event_sink_wrapper: PyEventSinkWrapper) -> NeosynthResult<Self> {
-        let instance = Self {
-            mixer: Arc::new(SpeechMixer::new(event_sink_wrapper)?),
-        };
+        let instance = Self(Arc::new(SpeechMixer::new(event_sink_wrapper)?));
         instance.initialize()?;
         Ok(instance)
     }
+
     fn initialize(&self) -> NeosynthResult<()> {
-        self.mixer.player.SetAutoPlay(true)?;
         // Remove extended silence at the end of each speech utterance
         if ApiInformation::IsApiContractPresentByMajorAndMinor(
             &HSTRING::from("Windows.Foundation.UniversalApiContract"),
             6,
             0,
         )? {
-            self.mixer
+            self.0
                 .synthesizer
                 .Options()?
                 .SetAppendedSilence(SpeechAppendedSilence::Min)?;
-        };
-        self.register_player_events()
+            self.0
+                .synthesizer
+                .Options()?
+                .SetPunctuationSilence(SpeechPunctuationSilence::Min)?;
+        }
+        self.register_events()?;
+        Ok(())
     }
 
-    fn register_player_events(&self) -> NeosynthResult<()> {
-        let mixer = Arc::clone(&self.mixer);
-        self.mixer
+    fn register_events(&self) -> NeosynthResult<()> {
+        let mixer = Arc::clone(&self.0);
+        self.0
             .player
+            .0
             .MediaEnded(&TypedEventHandler::<MediaPlayer, _>::new(move |_, _| {
                 mixer.process_queue().ok();
                 Ok(())
             }))?;
-        let mixer = Arc::clone(&self.mixer);
-        self.mixer.player.MediaFailed(&TypedEventHandler::<
-            MediaPlayer,
-            MediaPlayerFailedEventArgs,
-        >::new(move |_, _| {
-            mixer.process_queue().ok();
-            Ok(())
-        }))?;
-        let mixer = Arc::clone(&self.mixer);
-        self.mixer
+        let mixer = Arc::clone(&self.0);
+        self.0
             .player
-            .PlaybackSession()?
-            .PlaybackStateChanged(&TypedEventHandler::<MediaPlaybackSession, _>::new(
-                move |_, _| {
-                    mixer
-                        .event_sink
-                        .on_state_changed(mixer.get_state().unwrap());
-                    Ok(())
-                },
-            ))?;
+            .0
+            .MediaFailed(&TypedEventHandler::<MediaPlayer, _>::new(move |_, _| {
+                mixer.process_queue().ok();
+                Ok(())
+            }))?;
         Ok(())
-    }
-
-    fn is_prosody_supported() -> NeosynthResult<bool> {
-        Ok(ApiInformation::IsApiContractPresentByMajorAndMinor(
-            &HSTRING::from("Windows.Foundation.UniversalApiContract"),
-            5,
-            0,
-        )?)
     }
 }
 
@@ -366,23 +405,31 @@ impl Neosynth {
             Ok(Self::new(PyEventSinkWrapper::new(event_sink))?)
         }
     }
-
+    /// Indicates if the prosody option is supported
+    #[staticmethod]
+    pub fn is_prosody_supported() -> NeosynthResult<bool> {
+        Ok(ApiInformation::IsApiContractPresentByMajorAndMinor(
+            &HSTRING::from("Windows.Foundation.UniversalApiContract"),
+            5,
+            0,
+        )?)
+    }
     /// Get the current state of the synthesizer
     #[pyo3(text_signature = "($self) -> neosynth.SynthState")]
     pub fn get_state(&self) -> NeosynthResult<SynthState> {
-        self.mixer.get_state()
+        self.0.get_state()
     }
 
     /// Get the current volume
     #[pyo3(text_signature = "($self) -> float")]
     pub fn get_volume(&self) -> NeosynthResult<f64> {
-        Ok(self.mixer.player.Volume()? * 100f64)
+        self.0.player.get_volume()
     }
 
     /// Set the current volume
     #[pyo3(text_signature = "($self, volume: float)")]
     pub fn set_volume(&self, volume: f64) -> NeosynthResult<()> {
-        Ok(self.mixer.player.SetVolume(volume / 100f64)?)
+        self.0.player.set_volume(volume)
     }
     /// Get the current speaking rate
     #[pyo3(text_signature = "($self) -> float")]
@@ -390,7 +437,7 @@ impl Neosynth {
         if !Self::is_prosody_supported()? {
             Ok(-1.0)
         } else {
-            Ok(self.mixer.synthesizer.Options()?.SpeakingRate()? / 0.06)
+            Ok(self.0.synthesizer.Options()?.SpeakingRate()? / 0.06)
         }
     }
     /// Set the current speaking rate
@@ -398,7 +445,7 @@ impl Neosynth {
     pub fn set_rate(&self, value: f64) -> NeosynthResult<()> {
         if Self::is_prosody_supported()? {
             Ok(self
-                .mixer
+                .0
                 .synthesizer
                 .Options()?
                 .SetSpeakingRate(value * 0.06)?)
@@ -409,16 +456,26 @@ impl Neosynth {
             ))
         }
     }
+    /// Get the voice pitch
+    #[pyo3(text_signature = "($self) -> float")]
+    pub fn get_pitch(&self) -> NeosynthResult<f64> {
+        Ok(self.0.synthesizer.Options()?.AudioPitch()? * 50.0)
+    }
+    /// Set the voice pitch
+    #[pyo3(text_signature = "($self, pitch: float)")]
+    pub fn set_pitch(&self, value: f64) -> NeosynthResult<()> {
+        Ok(self.0.synthesizer.Options()?.SetAudioPitch(value / 50.0)?)
+    }
     /// Get the current voice
     #[pyo3(text_signature = "($self) -> neosynth.VoiceInfo")]
     pub fn get_voice(&self) -> NeosynthResult<VoiceInfo> {
-        Ok(self.mixer.synthesizer.Voice()?.into())
+        Ok(self.0.synthesizer.Voice()?.into())
     }
     /// Set the current voice
     #[pyo3(text_signature = "($self, voice: neosynth.VoiceInfo)")]
     pub fn set_voice(&self, voice: &VoiceInfo) -> NeosynthResult<()> {
         Ok(self
-            .mixer
+            .0
             .synthesizer
             .SetVoice(&VoiceInformation::from(voice))?)
     }
@@ -449,34 +506,32 @@ impl Neosynth {
     /// Speak a neosynth.SpeechUtterance
     #[pyo3(text_signature = "($self, utterance: neosynth.SpeechUtterance)")]
     pub fn speak(&self, utterance: SpeechUtterance) -> NeosynthResult<()> {
-        self.mixer.speak(utterance.content)
+        self.0.speak(utterance.0)?;
+        self.0.set_state(SynthState::Busy)?;
+        self.0.player.play()?;
+        Ok(())
     }
     /// Pause the speech
     #[pyo3(text_signature = "($self)")]
     pub fn pause(&self) -> NeosynthResult<()> {
-        Ok(self.mixer.player.Pause()?)
+        self.0.set_state(SynthState::Paused)?;
+        self.0.player.pause()?;
+        Ok(())
     }
     /// Resume the speech
     #[pyo3(text_signature = "($self)")]
     pub fn resume(&self) -> NeosynthResult<()> {
-        Ok(self.mixer.player.Play()?)
+        self.0.set_state(SynthState::Busy)?;
+        self.0.player.resume()?;
+        Ok(())
     }
     /// Stop the speech
     #[pyo3(text_signature = "($self)")]
     pub fn stop(&self) -> NeosynthResult<()> {
-        self.pause()?;
-        // Drop any queued elements
-        loop {
-            if self.mixer.speech_queue.pop().is_none() {
-                break;
-            }
-        }
-        let empty_stream = InMemoryRandomAccessStream::new()?;
-        self.mixer.player.SetSource(&MediaSource::CreateFromStream(
-            &empty_stream,
-            &HSTRING::from(""),
-        )?)?;
-        self.mixer.process_queue()
+        self.0.player.stop()?;
+        self.0.clear_speech_queue()?;
+        self.0.process_queue()?;
+        Ok(())
     }
 }
 
