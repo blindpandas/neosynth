@@ -3,8 +3,12 @@
 """Shows the usage of Neosynth."""
 
 
+import logging
 import neosynth
 
+
+FORMAT = '%(levelname)s %(name)s %(asctime)-15s %(filename)s:%(lineno)d %(message)s'
+logging.basicConfig(format=FORMAT)
 
 
 class EventSink:
@@ -19,6 +23,8 @@ class EventSink:
     def on_bookmark_reached(self, bookmark):
         print(f"Bookmark reached: {bookmark}")
 
+    def log(self, message, level):
+        print(f"LOG {level}: {message}")
 
 
 def main():
@@ -30,10 +36,18 @@ def main():
     # create the speech utterance
     ut = neosynth.SpeechUtterance()
     ut.add_text("Hello there.")
-    ut.add_bookmark("bookmark1")
     ut.add_text("And another thing.")
-    ut.add_bookmark("bookmark2")
     ut.add_text("Goodbye!")
+    ut.add_ssml("""
+        <speak version="1.0" xml:lang="en-US">
+          <s>Hello Musharraf</s>
+          <mark name="mark1"/>
+          <s>Rust is the best</s>
+          <mark name="mark2"/>
+          <s>Bye</s>
+          <mark name="it_works"/>
+        </speak>
+    """.strip())
     # Speak 
     synth.speak(ut)
 

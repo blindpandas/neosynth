@@ -6,8 +6,14 @@ use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 use windows::{
-    core::HSTRING, Foundation::Metadata::ApiInformation, Foundation::TypedEventHandler,
-    Media::Core::MediaSource, Media::Playback::*, Media::SpeechSynthesis::*, Storage::StorageFile,
+    core::{Interface, HSTRING},
+    Foundation::Collections::{CollectionChange, IVectorChangedEventArgs},
+    Foundation::Metadata::ApiInformation,
+    Foundation::TypedEventHandler,
+    Media::Core::{MediaCueEventArgs, MediaSource, SpeechCue, TimedMetadataTrack},
+    Media::Playback::*,
+    Media::SpeechSynthesis::*,
+    Storage::StorageFile,
     Storage::Streams::InMemoryRandomAccessStream,
 };
 
@@ -106,10 +112,6 @@ impl SpeechUtterance {
     fn add_ssml(&mut self, ssml: String) {
         self.0.push(SpeechElement::Ssml(ssml));
     }
-    #[pyo3(text_signature = "($self, bookmark: str)")]
-    fn add_bookmark(&mut self, bookmark: String) {
-        self.0.push(SpeechElement::Bookmark(bookmark));
-    }
     #[pyo3(text_signature = "($self, audio_path: str)")]
     fn add_audio(&mut self, audio_path: String) {
         self.0.push(SpeechElement::Audio(audio_path));
@@ -152,6 +154,7 @@ impl From<&VoiceInfo> for VoiceInformation {
 pub trait NsEventSink {
     fn on_state_changed(&self, new_state: SynthState);
     fn on_bookmark_reached(&self, bookmark: String);
+    fn log(&self, message: &str, level: &str);
 }
 
 pub struct PyEventSinkWrapper(PyObject);
@@ -177,15 +180,66 @@ impl NsEventSink for PyEventSinkWrapper {
                 .ok();
         });
     }
+    fn log(&self, message: &str, level: &str) {
+        Python::with_gil(|py| {
+            self.0.call_method1(py, "log", (message, level)).ok();
+        });
+    }
 }
 
-pub struct NeoMediaPlayer(MediaPlayer);
+pub fn register_event_sink<T>(item: &MediaPlaybackItem, event_sink: &Arc<T>) -> NeosynthResult<()>
+where
+    T: NsEventSink + std::marker::Send + std::marker::Sync + 'static,
+{
+    let timed_metadata_tracks = item.TimedMetadataTracks()?;
+    for (idx, track) in timed_metadata_tracks.clone().into_iter().enumerate() {
+        if track.Id()? == "SpeechBookmark" {
+            register_bookmark_track(&item, idx.try_into().unwrap(), event_sink)?
+        };
+    }
+    Ok(())
+}
 
-impl NeoMediaPlayer {
-    fn new() -> NeosynthResult<Self> {
+pub fn register_bookmark_track<T>(
+    item: &MediaPlaybackItem,
+    idx: u32,
+    event_sink: &Arc<T>,
+) -> NeosynthResult<()>
+where
+    T: NsEventSink + std::marker::Send + std::marker::Sync + 'static,
+{
+    item.TimedMetadataTracks()?.SetPresentationMode(
+        idx,
+        TimedMetadataTrackPresentationMode::ApplicationPresented,
+    )?;
+    let sink = Arc::clone(&event_sink);
+    item.TimedMetadataTracks()?
+        .GetAt(idx)?
+        .CueEntered(
+            &TypedEventHandler::<TimedMetadataTrack, MediaCueEventArgs>::new(
+                move |_, event_args| {
+                    if let Some(event_args) = event_args {
+                        let speech_cue: Result<SpeechCue, _> = event_args.Cue()?.cast();
+                        sink.on_bookmark_reached(speech_cue?.Text()?.to_string_lossy());
+                    };
+                    Ok(())
+                },
+            ),
+        )?;
+    Ok(())
+}
+
+pub struct NeoMediaPlayer<T>(MediaPlayer, Arc<T>);
+
+impl<T> NeoMediaPlayer<T>
+where
+    T: NsEventSink + std::marker::Send + std::marker::Sync + 'static,
+{
+    fn new(event_sink: T) -> NeosynthResult<Self> {
         let win_player = MediaPlayer::new()?;
+        win_player.SetRealTimePlayback(true)?;
         win_player.SetAudioCategory(MediaPlayerAudioCategory::Speech)?;
-        Ok(Self(win_player))
+        Ok(Self(win_player, Arc::new(event_sink)))
     }
     pub fn get_playback_state(&self) -> NeosynthResult<MediaPlaybackState> {
         Ok(self.0.PlaybackSession()?.PlaybackState()?)
@@ -197,10 +251,29 @@ impl NeoMediaPlayer {
         Ok(self.0.SetVolume(volume / 100f64)?)
     }
     fn set_speech_stream_source(&self, stream: SpeechSynthesisStream) -> NeosynthResult<()> {
-        self.0.SetSource(&MediaSource::CreateFromStream(
-            &stream,
-            &stream.ContentType()?,
-        )?)?;
+        let _source = MediaSource::CreateFromStream(&stream, &stream.ContentType()?)?;
+        let item = MediaPlaybackItem::Create(&_source)?;
+        let evtsink = Arc::clone(&self.1);
+        // Register events in existing TimedMetadataTracks
+        register_event_sink(&item, &evtsink)?;
+        // Register events for future tracks
+        let evtsink = Arc::clone(&self.1);
+        item.TimedMetadataTracksChanged(&TypedEventHandler::<
+            MediaPlaybackItem,
+            IVectorChangedEventArgs,
+        >::new(move |item, args| {
+            if let Some(item) = item {
+                if let Some(args) = args {
+                    if args.CollectionChange()? == CollectionChange::ItemInserted {
+                        register_bookmark_track(&item, args.Index()?, &evtsink).ok();
+                    } else if args.CollectionChange()? == CollectionChange::Reset {
+                        register_event_sink(&item, &evtsink).ok();
+                    };
+                }
+            }
+            Ok(())
+        }))?;
+        self.0.SetSource(&item)?;
         Ok(())
     }
     fn set_file_source(&self, file_path: String) -> NeosynthResult<()> {
@@ -239,10 +312,9 @@ where
     T: NsEventSink + std::marker::Send + std::marker::Sync + 'static,
 {
     synthesizer: SpeechSynthesizer,
-    player: NeoMediaPlayer,
+    player: NeoMediaPlayer<T>,
     state: RwLock<SynthState>,
     speech_queue: SegQueue<SpeechElement>,
-    event_sink: T,
 }
 
 impl<T> SpeechMixer<T>
@@ -252,10 +324,9 @@ where
     pub fn new(event_sink: T) -> NeosynthResult<Self> {
         Ok(Self {
             synthesizer: SpeechSynthesizer::new()?,
-            player: NeoMediaPlayer::new()?,
+            player: NeoMediaPlayer::new(event_sink)?,
             state: RwLock::new(Default::default()),
             speech_queue: SegQueue::new(),
-            event_sink,
         })
     }
 
@@ -267,7 +338,7 @@ where
         if self.get_state()? != state {
             let mut wst = self.state.write().unwrap();
             *wst = state;
-            self.event_sink.on_state_changed(state);
+            self.player.1.on_state_changed(state);
         }
         Ok(())
     }
@@ -287,24 +358,34 @@ where
         let output = if is_ssml {
             self.synthesizer
                 .SynthesizeSsmlToStreamAsync(&HSTRING::from(text))?
-                .get()?
+                .get()
         } else {
             self.synthesizer
                 .SynthesizeTextToStreamAsync(&HSTRING::from(text))?
-                .get()?
+                .get()
         };
-        Ok(output)
+        match output {
+            Ok(output) => Ok(output),
+            Err(e) => {
+                self.player.1.on_state_changed(SynthState::Ready);
+                self.player.1.log(
+                    format!("Error generating speech stream: {}", e.code().0).as_str(),
+                    "error"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     pub fn process_speech_element(&self, element: SpeechElement) -> NeosynthResult<()> {
         match element {
             SpeechElement::Text(text) => self.speak_content(&text, false)?,
             SpeechElement::Ssml(ssml) => self.speak_content(&ssml, true)?,
+            SpeechElement::Audio(filename) => self.player.set_file_source(filename)?,
             SpeechElement::Bookmark(bookmark) => {
-                self.event_sink.on_bookmark_reached(bookmark);
+                self.player.1.on_bookmark_reached(bookmark);
                 self.process_queue()?;
             }
-            SpeechElement::Audio(filename) => self.player.set_file_source(filename)?,
         };
         Ok(())
     }
