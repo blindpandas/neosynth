@@ -370,7 +370,7 @@ where
                 self.player.1.on_state_changed(SynthState::Ready);
                 self.player.1.log(
                     format!("Error generating speech stream: {}", e.code().0).as_str(),
-                    "error"
+                    "error",
                 );
                 Err(e.into())
             }
