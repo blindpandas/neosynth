@@ -1,3 +1,4 @@
+use crossbeam_queue::SegQueue;
 use pyo3::exceptions::{PyOSError, PyRuntimeError, PyTypeError};
 use pyo3::intern;
 use pyo3::prelude::*;
@@ -85,6 +86,42 @@ impl From<MediaPlaybackState> for SynthState {
     }
 }
 
+#[derive(Clone)]
+pub enum SpeechElement {
+    Text(String),
+    Ssml(String),
+    Bookmark(String),
+    Audio(String),
+}
+
+#[pyclass(subclass)]
+#[derive(Default, Clone)]
+pub struct SpeechUtterance(Vec<SpeechElement>);
+
+#[pymethods]
+impl SpeechUtterance {
+    #[new]
+    pub fn new() -> Self {
+        Default::default()
+    }
+    #[pyo3(text_signature = "($self, text: str)")]
+    fn add_text(&mut self, text: String) {
+        self.0.push(SpeechElement::Text(text));
+    }
+    #[pyo3(text_signature = "($self, ssml: str)")]
+    fn add_ssml(&mut self, ssml: String) {
+        self.0.push(SpeechElement::Ssml(ssml));
+    }
+    #[pyo3(text_signature = "($self, audio_path: str)")]
+    fn add_audio(&mut self, audio_path: String) {
+        self.0.push(SpeechElement::Audio(audio_path));
+    }
+    #[pyo3(text_signature = "($self, utterance: neosynth.SpeechUtterance)")]
+    fn add_utterance(&mut self, utterance: &mut Self) {
+        self.0.append(&mut utterance.0);
+    }
+}
+
 #[pyclass(frozen)]
 #[derive(Debug)]
 pub struct VoiceInfo {
@@ -155,9 +192,9 @@ where
     T: NsEventSink + std::marker::Send + std::marker::Sync + 'static,
 {
     let timed_metadata_tracks = item.TimedMetadataTracks()?;
-    for (idx, track) in timed_metadata_tracks.into_iter().enumerate() {
+    for (idx, track) in timed_metadata_tracks.clone().into_iter().enumerate() {
         if track.Id()? == "SpeechBookmark" {
-            register_bookmark_track(item, idx.try_into().unwrap(), event_sink)?
+            register_bookmark_track(&item, idx.try_into().unwrap(), event_sink)?
         };
     }
     Ok(())
@@ -175,7 +212,7 @@ where
         idx,
         TimedMetadataTrackPresentationMode::ApplicationPresented,
     )?;
-    let sink = Arc::clone(event_sink);
+    let sink = Arc::clone(&event_sink);
     item.TimedMetadataTracks()?
         .GetAt(idx)?
         .CueEntered(
@@ -228,9 +265,9 @@ where
             if let Some(item) = item {
                 if let Some(args) = args {
                     if args.CollectionChange()? == CollectionChange::ItemInserted {
-                        register_bookmark_track(item, args.Index()?, &evtsink).ok();
+                        register_bookmark_track(&item, args.Index()?, &evtsink).ok();
                     } else if args.CollectionChange()? == CollectionChange::Reset {
-                        register_event_sink(item, &evtsink).ok();
+                        register_event_sink(&item, &evtsink).ok();
                     };
                 }
             }
@@ -239,7 +276,6 @@ where
         self.0.SetSource(&item)?;
         Ok(())
     }
-    #[allow(dead_code)]
     fn set_file_source(&self, file_path: String) -> NeosynthResult<()> {
         let audiofile = StorageFile::GetFileFromPathAsync(&HSTRING::from(file_path))?.get()?;
         self.0
@@ -278,6 +314,7 @@ where
     synthesizer: SpeechSynthesizer,
     player: NeoMediaPlayer<T>,
     state: RwLock<SynthState>,
+    speech_queue: SegQueue<SpeechElement>,
 }
 
 impl<T> SpeechMixer<T>
@@ -289,6 +326,7 @@ where
             synthesizer: SpeechSynthesizer::new()?,
             player: NeoMediaPlayer::new(event_sink)?,
             state: RwLock::new(Default::default()),
+            speech_queue: SegQueue::new(),
         })
     }
 
@@ -308,8 +346,6 @@ where
     pub fn speak_content(&self, text: &str, is_ssml: bool) -> NeosynthResult<()> {
         let stream = self.generate_speech_stream(text, is_ssml)?;
         self.player.set_speech_stream_source(stream)?;
-        self.player.play()?;
-        self.set_state(SynthState::Busy)?;
         self.player.play()?;
         Ok(())
     }
@@ -339,6 +375,48 @@ where
                 Err(e.into())
             }
         }
+    }
+
+    pub fn process_speech_element(&self, element: SpeechElement) -> NeosynthResult<()> {
+        match element {
+            SpeechElement::Text(text) => self.speak_content(&text, false)?,
+            SpeechElement::Ssml(ssml) => self.speak_content(&ssml, true)?,
+            SpeechElement::Audio(filename) => self.player.set_file_source(filename)?,
+            SpeechElement::Bookmark(bookmark) => {
+                self.player.1.on_bookmark_reached(bookmark);
+                self.process_queue()?;
+            }
+        };
+        Ok(())
+    }
+
+    fn process_queue(&self) -> NeosynthResult<()> {
+        match self.speech_queue.pop() {
+            Some(elem) => self.process_speech_element(elem),
+            None => {
+                self.set_state(SynthState::Ready)?;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn speak<I>(&self, utterance: I) -> NeosynthResult<()>
+    where
+        I: IntoIterator<Item = SpeechElement>,
+    {
+        self.clear_speech_queue()?;
+        utterance
+            .into_iter()
+            .for_each(|elem| self.speech_queue.push(elem));
+        self.process_queue()
+    }
+    pub fn clear_speech_queue(&self) -> NeosynthResult<()> {
+        loop {
+            if self.speech_queue.pop().is_none() {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -378,7 +456,7 @@ impl Neosynth {
             .player
             .0
             .MediaEnded(&TypedEventHandler::<MediaPlayer, _>::new(move |_, _| {
-                mixer.set_state(SynthState::Ready).ok();
+                mixer.process_queue().ok();
                 Ok(())
             }))?;
         let mixer = Arc::clone(&self.0);
@@ -386,7 +464,7 @@ impl Neosynth {
             .player
             .0
             .MediaFailed(&TypedEventHandler::<MediaPlayer, _>::new(move |_, _| {
-                mixer.set_state(SynthState::Ready).ok();
+                mixer.process_queue().ok();
                 Ok(())
             }))?;
         Ok(())
@@ -508,11 +586,11 @@ impl Neosynth {
     }
     /// Speak a neosynth.SpeechUtterance
     #[pyo3(text_signature = "($self, utterance: neosynth.SpeechUtterance)")]
-    pub fn speak_text(&self, text: &str) -> NeosynthResult<()> {
-        self.0.speak_content(text, false)
-    }
-    pub fn speak_ssml(&self, ssml: &str) -> NeosynthResult<()> {
-        self.0.speak_content(ssml, true)
+    pub fn speak(&self, utterance: SpeechUtterance) -> NeosynthResult<()> {
+        self.0.speak(utterance.0)?;
+        self.0.set_state(SynthState::Busy)?;
+        self.0.player.play()?;
+        Ok(())
     }
     /// Pause the speech
     #[pyo3(text_signature = "($self)")]
@@ -532,6 +610,8 @@ impl Neosynth {
     #[pyo3(text_signature = "($self)")]
     pub fn stop(&self) -> NeosynthResult<()> {
         self.0.player.stop()?;
+        self.0.clear_speech_queue()?;
+        self.0.process_queue()?;
         Ok(())
     }
 }
@@ -541,6 +621,7 @@ impl Neosynth {
 fn neosynth(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<Neosynth>()?;
     m.add_class::<SynthState>()?;
+    m.add_class::<SpeechUtterance>()?;
     m.add_class::<VoiceInfo>()?;
     Ok(())
 }
