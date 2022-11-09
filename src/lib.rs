@@ -192,9 +192,9 @@ where
     T: NsEventSink + std::marker::Send + std::marker::Sync + 'static,
 {
     let timed_metadata_tracks = item.TimedMetadataTracks()?;
-    for (idx, track) in timed_metadata_tracks.clone().into_iter().enumerate() {
+    for (idx, track) in timed_metadata_tracks.into_iter().enumerate() {
         if track.Id()? == "SpeechBookmark" {
-            register_bookmark_track(&item, idx.try_into().unwrap(), event_sink)?
+            register_bookmark_track(item, idx.try_into().unwrap(), event_sink)?
         };
     }
     Ok(())
@@ -212,7 +212,7 @@ where
         idx,
         TimedMetadataTrackPresentationMode::ApplicationPresented,
     )?;
-    let sink = Arc::clone(&event_sink);
+    let sink = Arc::clone(event_sink);
     item.TimedMetadataTracks()?
         .GetAt(idx)?
         .CueEntered(
@@ -265,9 +265,9 @@ where
             if let Some(item) = item {
                 if let Some(args) = args {
                     if args.CollectionChange()? == CollectionChange::ItemInserted {
-                        register_bookmark_track(&item, args.Index()?, &evtsink).ok();
+                        register_bookmark_track(item, args.Index()?, &evtsink).ok();
                     } else if args.CollectionChange()? == CollectionChange::Reset {
-                        register_event_sink(&item, &evtsink).ok();
+                        register_event_sink(item, &evtsink).ok();
                     };
                 }
             }
@@ -424,27 +424,39 @@ where
 pub struct Neosynth(Arc<SpeechMixer<PyEventSinkWrapper>>);
 
 impl Neosynth {
-    pub fn new(event_sink_wrapper: PyEventSinkWrapper) -> NeosynthResult<Self> {
+    pub fn new(
+        event_sink_wrapper: PyEventSinkWrapper,
+        speech_appended_silence: bool,
+        punctuation_silence: bool,
+    ) -> NeosynthResult<Self> {
         let instance = Self(Arc::new(SpeechMixer::new(event_sink_wrapper)?));
-        instance.initialize()?;
+        instance.initialize(speech_appended_silence, punctuation_silence)?;
         Ok(instance)
     }
 
-    fn initialize(&self) -> NeosynthResult<()> {
+    fn initialize(
+        &self,
+        speech_appended_silence: bool,
+        punctuation_silence: bool,
+    ) -> NeosynthResult<()> {
         // Remove extended silence at the end of each speech utterance
         if ApiInformation::IsApiContractPresentByMajorAndMinor(
             &HSTRING::from("Windows.Foundation.UniversalApiContract"),
             6,
             0,
         )? {
-            self.0
-                .synthesizer
-                .Options()?
-                .SetAppendedSilence(SpeechAppendedSilence::Min)?;
-            self.0
-                .synthesizer
-                .Options()?
-                .SetPunctuationSilence(SpeechPunctuationSilence::Min)?;
+            if speech_appended_silence {
+                self.0
+                    .synthesizer
+                    .Options()?
+                    .SetAppendedSilence(SpeechAppendedSilence::Min)?;
+            }
+            if punctuation_silence {
+                self.0
+                    .synthesizer
+                    .Options()?
+                    .SetPunctuationSilence(SpeechPunctuationSilence::Min)?;
+            }
         }
         self.register_events()?;
         Ok(())
@@ -474,7 +486,13 @@ impl Neosynth {
 #[pymethods]
 impl Neosynth {
     #[new]
-    pub fn py_init(py: Python<'_>, event_sink: PyObject) -> PyResult<Self> {
+    #[args(speech_appended_silence = "false", punctuation_silence = false)]
+    pub fn py_init(
+        py: Python<'_>,
+        event_sink: PyObject,
+        speech_appended_silence: bool,
+        punctuation_silence: bool,
+    ) -> PyResult<Self> {
         let obj: &PyAny = event_sink.as_ref(py);
         if (!obj.hasattr(intern!(py, "on_state_changed"))?)
             || (!obj.hasattr(intern!(py, "on_bookmark_reached"))?)
@@ -483,7 +501,11 @@ impl Neosynth {
                 "The provided object does not have the required method handlers.",
             ))
         } else {
-            Ok(Self::new(PyEventSinkWrapper::new(event_sink))?)
+            Ok(Self::new(
+                PyEventSinkWrapper::new(event_sink),
+                speech_appended_silence,
+                punctuation_silence,
+            )?)
         }
     }
     /// Indicates if the prosody option is supported

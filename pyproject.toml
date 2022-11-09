@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "neosynth"
+version = "3.1.0"
+description = "A python wrapper around the Windows OneCore speech synthesizer"
+authors = ["mush42 <musharraf.omer@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "3.7 3.8 3.9 3.10 3.11"
+
+[tool.poetry.group.dev.dependencies]
+maturin = "^0.13.7"
+invoke = "^1.7.3"
+
+[build-system]
+requires = ["maturin>=0.13,<0.14"]
+build-backend = "maturin"

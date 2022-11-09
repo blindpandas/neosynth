@@ -27,7 +27,7 @@ def get_python_interpreters():
 
 
 @task
-def build_wheels(c, release=True, strip=True):
+def build_wheels(c, release=True, strip=True, sdist=True):
     i_args = {
         exe: "i686-pc-windows-msvc" if arch == "32" else "x86_64-pc-windows-msvc"
         for (exe, arch) in get_python_interpreters()
@@ -39,6 +39,7 @@ def build_wheels(c, release=True, strip=True):
                 "maturin build",
                 "--release" if release else "",
                 "--strip" if strip else "",
+                "--sdist",
                 f"-i {interpreter_path}",
                 f"--target {target}",
             ]
