@@ -445,13 +445,13 @@ impl Neosynth {
             6,
             0,
         )? {
-            if speech_appended_silence {
+            if !speech_appended_silence {
                 self.0
                     .synthesizer
                     .Options()?
                     .SetAppendedSilence(SpeechAppendedSilence::Min)?;
             }
-            if punctuation_silence {
+            if !punctuation_silence {
                 self.0
                     .synthesizer
                     .Options()?
